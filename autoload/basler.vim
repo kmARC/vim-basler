@@ -20,9 +20,6 @@ endfunction
 " Returns:
 "   result: 
 function! basler#bazel_info() abort
-  if s:bazel_info != {}
-    return
-  endif
   function! s:out_handler(channel, msg) abort
     let [k, v] = split(a:msg, ':\s\+')
     let s:bazel_info[k] = v
@@ -34,7 +31,7 @@ function! basler#bazel_info() abort
       echowindow 'Querying bazel info` failed'
     endif
   endfunction
-  call job_start(s:bazel_base_cmd . ' info ', {
+  return job_start(s:bazel_base_cmd . ' info ', {
         \ 'mode': 'nl',
         \ 'out_cb': 's:out_handler',
         \ 'exit_cb': 's:exit_handler',
@@ -91,11 +88,13 @@ function! basler#include_expr(fname) abort
 
     if attempt == 0 && s:fetched->index(a:fname) == -1
       try
-        call system(s:bazel_base_cmd . ' fetch --remote_download_minimal ' . a:fname)
+        call system(s:bazel_base_cmd . ' fetch --remote_download_outputs=minimal ' . a:fname)
         let s:fetched += [a:fname]
       endtry
     endif
   endfor
+
+  return a:fname
 endfunction
 
 
