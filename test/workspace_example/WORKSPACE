@@ -1,0 +1,3 @@
+load("//dir1:http_archive.bzl", "http_archive")
+
+http_archive()
