@@ -16,6 +16,8 @@ let s:bazel_info = {}
 let s:fname_cache = {}
 let s:bazel_labels = []
 let s:fetched = []
+let s:workspace_to_repo = {}
+let s:repo_to_workspace = {}
 
 let s:query_channel_workspace = {}
 let s:info_channel_workspace = {}
@@ -83,9 +85,9 @@ function! basler#bazel_info() abort
 
   call s:log(" - unknown workspace, processing:", unknown_workspace)
 
-  let command = s:bazel('info')
-  call s:log('  - invoking:', command)
-  let job = job_start(command, {
+  let cmd = s:bazel('info')
+  call s:log('  - invoking:', cmd)
+  let job = job_start(cmd, {
         \ 'mode': 'nl',
         \ 'out_cb': 's:info_out_handler',
         \ 'exit_cb': 's:info_exit_handler',
@@ -98,17 +100,22 @@ endfunction
 function! basler#bazel_query_all(workspace) abort
   call s:log("basler#bazel_query_all(". a:workspace .")")
 
+  let repo = s:workspace_to_repo->get(a:workspace, '')
+
   if !s:bazel_info->has_key(a:workspace)
     call s:log(" - !!! Bazel not ready !!!")
     return
   endif
+
+  call s:log('whats happening')
 
   function! s:query_out_handler(channel, msg) abort
     let workspace = s:query_channel_workspace[a:channel->ch_info()->get("id")]
     let file = a:msg->split(':')->get(0, '')
     let label = '//' . a:msg->split('//')->get(1, '')
     if file != '' && label != ''
-      let s:fname_cache[workspace][label] = [file]
+      let repo = s:workspace_to_repo->get(workspace, '')
+      let s:fname_cache[repo][label] = [file]
     endif
   endfunction
 
@@ -124,15 +131,15 @@ function! basler#bazel_query_all(workspace) abort
     endif
   endfunction
 
-  let command = s:bazel_query("//...:*", "--output=location")
-  call s:log('  - invoking:', command)
-  let job = job_start(command, {
+  let cmd = s:bazel_query("//...:*", "--output=location")
+  call s:log('  - invoking:', cmd)
+  let job = job_start(cmd, {
         \ 'mode': 'nl',
         \ 'out_cb': 's:query_out_handler',
         \ 'exit_cb': 's:query_exit_handler',
         \ 'cwd': a:workspace,
         \ })
-  let s:fname_cache[a:workspace] = {}
+  let s:fname_cache[repo] = {}
   let s:query_channel_workspace[job_getchannel(job)->ch_info()->get("id")] = a:workspace
 endfunction
 
@@ -163,66 +170,98 @@ function! basler#workspace_root(...) abort
   return s:bazel_info->get(possible_workspace_root, {})->get("workspace", "")
 endfunction
 
-function! s:label_of(pkg, path, name)
-  return '@' . a:pkg . '//' . a:path . ':' . a:name
+function! s:label_of(repo, package, name)
+  return '@' . a:repo . '//' . a:package . ':' . a:name
 endfunction
 
-function! s:possible_paths(workspace, fname)
+function! s:possible_paths(workspace, fname, ...)
   call s:log("s:possible_paths(". a:workspace .", " . a:fname . ")")
+  let current_repo = s:workspace_to_repo->get(a:workspace, '')
 
-  let cache_entry = s:fname_cache->get(a:workspace, {})->get(a:fname, [])
+  let [_, _, repo, _, package, name] = matchlist(a:fname, '\(@\([^/]*\)\)\?\(//\([^:]*\)\)\?:\?\(.*\)')[0:5]
+  "                                              example: ...@......repo.....//..package....:...name..
+
+  if repo == ''
+    let repo = current_repo
+  endif
+
+  call s:log(" - repo:", repo)
+
+  let cache_entry = s:fname_cache->get(repo, {})->get(a:fname, [])
 
   if cache_entry != []
     call s:log(" - found cache entry:", cache_entry)
     return cache_entry
   endif
 
-  let [_, _, pkg, _, path, name] = matchlist(a:fname, '\(@\([^/]\+\)\)\?\(//\([^:]*\)\)\?:\?\(.*\)')[0:5]
-  "                                          example: ...@......pkg.......//.....path....:...name..
-
-  " In case name is missing, the last segment of path is the name
+  " In case name is missing, the last segment of package is the name
   if name == ''
-    let name = path->split('/')[-1]
-    return s:possible_paths(s:label_of(pkg, path, name))
+    let name = package->split('/')[-1]
   endif
+
+  call s:log("1")
 
   " In case this is a relative name (starts with a ':'), then try to check
-  " if it exists under the path of the opened file
+  " if it exists under the package of the opened file
   if a:fname->stridx(':') == 0
     let path = expand('%:h')
-    return s:possible_paths(s:label_of(pkg, path, name))
+    let possible_file =  path . "/" . name
+    call s:log("possible file: ". possible_file)
+
+    while !filereadable(possible_file)
+      let path = fnamemodify(path, ":h")
+      let possible_file =  path . "/" . name
+      call s:log("possible file: ". possible_file)
+      if path == a:workspace || path == "/"
+        break
+      endif
+    endwhile
+    if filereadable(possible_file)
+      let s:fname_cache[repo][a:fname] = [possible_file]
+      return [possible_file]
+    endif
   endif
 
-  " In case a file name can be constructed easily and the file exists
-  let possible_file = a:workspace . "/" . path . "/" . name
-  if filereadable(possible_file)
-    let s:fname_cache[a:workspace][a:fname] = [possible_file]
-    call s:log(' - actual file found:', possible_file)
-    return [possible_file]
-  endif
 
   let possible_paths = []
+  call s:log("2")
 
-  let build_file = systemlist(s:bazel_query('--output=location', s:label_of(pkg, path, name), " 2>/dev/null"))
-                   \ ->get(-1, '')->split(':')->get(0, '')
-  if build_file != ''
-    let possible_paths += [build_file]
-  else 
-    " No BUILD file found for the given name.
+  if s:repo_to_workspace->get(repo, '') != ''
+    call s:log("3")
+    let possible_paths += [
+          \ s:repo_to_workspace[repo] . '/' . package . '/' . name,
+          \ s:repo_to_workspace[repo] . '/' . package . '/BUILD',
+          \ s:repo_to_workspace[repo] . '/' . package . '/BUILD.bazel',
+          \ ]
+  else
+    call s:log("4")
+    let cmd = "pushd " . a:workspace . " >/dev/null && " .s:bazel_query('--output=location', s:label_of(repo, package, name)) . " 2>/dev/null"
+    let output = systemlist(cmd)
+    call s:log("5")
+    call s:log(cmd)
+    let split = output->get(-1, '')->split(':')->get(0, '')->split('/' . package . '/' . name)
+    call s:log("5.000 " , split)
+    if split == []
+      call s:log("5eeeee")
+      return []
+    endif
+    let workspace = split[0]
+    call s:log("6")
+    call s:log("7")
+    let s:workspace_to_repo[workspace] = repo
+    let s:repo_to_workspace[repo] = workspace
 
-    " In case "name" is a file that is not exported (e.g. in load statements),
-    " try to find the package root
-    let command = 'pushd ' . a:workspace . ' && ' . s:bazel_query('--output=location', s:label_of(pkg, path, '*')) . ' 2>/dev/null; popd &>/dev/null'
-    call s:log(' - invoking:', command)
-    let package_location = systemlist(command)->get(-2, '')->split(':')->get(0, '')->fnamemodify(':h')
-    call s:log(' - package location:', package_location)
-
-    let possible_paths += [package_location . '/' . name]
+    let possible_paths += [
+          \ workspace . '/' . package . '/' . name,
+          \ workspace . '/' . package . '/BUILD',
+          \ workspace . '/' . package . '/BUILD.bazel',
+          \ ]
   endif
 
   call s:log(' - possible paths found:', possible_paths)
 
-  let s:fname_cache[a:workspace][a:fname] = possible_paths
+  let s:fname_cache[repo] = s:fname_cache->get(repo, {})
+  let s:fname_cache[repo][a:fname] = possible_paths
 
   return possible_paths
 endfunction
